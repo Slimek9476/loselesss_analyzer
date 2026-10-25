@@ -32,7 +32,7 @@ def _analyze_once(
             handle.meta.frames,
             progress=progress,
         )
-        detection = detect(spectrum, handle.meta)
+        detection = detect(spectrum, handle.meta, spectrogram)
         meta = handle.meta
     return AnalysisResult(
         meta=meta,

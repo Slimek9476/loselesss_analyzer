@@ -332,18 +332,26 @@ def build_report(result: AnalysisResult, destination: str | Path) -> None:
         va="top",
         linespacing=1.4,
     )
+    meta_line = f"{name} · {format_audio_meta(result.meta)}"
+    if detection.effective_bits is not None:
+        meta_line += f" · фактически ≈{detection.effective_bits} бит"
     figure.text(
         0.075,
         0.840,
-        f"{name} · {format_audio_meta(result.meta)}",
+        meta_line,
         color=MUTED,
         fontsize=8.5,
     )
     if detection.estimated_source:
+        source_line = f"Вероятный исходный формат: {detection.estimated_source}"
+        if detection.time_consistency is not None:
+            source_line += (
+                f" · срез подтверждён в {detection.time_consistency:.0%} кадров"
+            )
         figure.text(
             0.075,
             0.815,
-            f"Вероятный исходный формат: {detection.estimated_source}",
+            source_line,
             color=FG,
             fontsize=8.5,
         )

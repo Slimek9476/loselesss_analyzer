@@ -22,6 +22,12 @@ MAX_SPECTROGRAM_FRAMES = 2600
 _BLOCK_FRAMES = 262_144
 _SILENCE_RMS = 1e-5  # кадры тише -100 dBFS не участвуют в усреднении
 
+# Проверка эффективной разрядности: сколько сэмплов достаточно посмотреть.
+_QUANT_SAMPLE_LIMIT = 1_500_000
+_QUANT_MIN_SAMPLES = 10_000
+_QUANT_16_TOLERANCE = 1e-3
+_QUANT_24_TOLERANCE = 0.75
+
 
 @dataclass
 class SpectrumData:
@@ -34,6 +40,7 @@ class SpectrumData:
     nyquist: float
     rms_db: float
     peak_db: float
+    grid_bits: int | None = None
 
 
 @dataclass
@@ -124,29 +131,40 @@ def compute_spectra(
     sg_max = -np.inf
 
     # --- Состояние потока -------------------------------------------------
-    buffer = np.empty(0, dtype=np.float64)
+    buffer = np.empty((0, file.channels), dtype=np.float32)
     buffer_start = 0  # абсолютный номер первого сэмпла в buffer
     next_spec = 0
     next_sg = 0
     read_frames = 0
     peak = 0.0
     sum_squares = 0.0
+    quant_samples = 0
+    quant_16_hits = 0
+    quant_24_hits = 0
 
     while True:
         block = file.read(_BLOCK_FRAMES, dtype="float32", always_2d=True)
         if block.size == 0:
             break
-        mono = block.mean(axis=1, dtype=np.float32).astype(np.float64, copy=False)
-        buffer = np.concatenate((buffer, mono)) if buffer.size else mono.copy()
-        buffer_end = buffer_start + buffer.size
+
+        # Сумма мощностей каналов: не теряет противофазный ВЧ-контент.
+        if buffer.shape[0] == 0:
+            buffer = block.copy()
+        else:
+            buffer = np.concatenate((buffer, block), axis=0)
+        buffer_end = buffer_start + buffer.shape[0]
 
         # Кадры усреднённого спектра.
         while next_spec + n_fft_spec <= buffer_end:
             offset = next_spec - buffer_start
-            frame = buffer[offset : offset + n_fft_spec]
-            rms = float(np.sqrt(np.mean(frame * frame))) if frame.size else 0.0
-            spectrum = np.fft.rfft(frame * win_spec)
-            power = (np.abs(spectrum) / norm_spec) ** 2
+            frame = buffer[offset : offset + n_fft_spec, :]
+            rms = (
+                float(np.sqrt(np.mean(frame * frame, dtype=np.float64)))
+                if frame.size
+                else 0.0
+            )
+            spectra = np.fft.rfft(frame * win_spec[:, None], axis=0)
+            power = np.mean(np.abs(spectra) ** 2, axis=1) / (norm_spec**2)
             power_sum_all += power
             frames_all += 1
             if rms >= _SILENCE_RMS:
@@ -159,24 +177,46 @@ def compute_spectra(
             next_sg + n_fft_sg <= buffer_end and len(sg_times) < MAX_SPECTROGRAM_FRAMES
         ):
             offset = next_sg - buffer_start
-            frame = buffer[offset : offset + n_fft_sg]
-            magnitude = np.abs(np.fft.rfft(frame * win_sg)) / norm_sg
-            levels = _db(magnitude).astype(np.float32)
+            frame = buffer[offset : offset + n_fft_sg, :]
+            spectra = np.fft.rfft(frame * win_sg[:, None], axis=0)
+            power = np.mean(np.abs(spectra) ** 2, axis=1) / (norm_sg**2)
+            levels = (10.0 * np.log10(np.maximum(power, 1e-24))).astype(np.float32)
             sg_matrix[:, len(sg_times)] = levels
             sg_times.append(next_sg / sample_rate)
             sg_max = max(sg_max, float(levels.max()))
             next_sg += hop_sg
 
+        # Оценка эффективной разрядности по сетке квантования.
+        if quant_samples < _QUANT_SAMPLE_LIMIT:
+            values = block.reshape(-1)
+            values = values[np.abs(values) > 1e-4]
+            if values.size:
+                stride = max(1, values.size // 150_000)
+                values = values[::stride].astype(np.float64)
+                scaled16 = values * 32_768.0
+                quant_16_hits += int(
+                    np.count_nonzero(
+                        np.abs(scaled16 - np.round(scaled16)) <= _QUANT_16_TOLERANCE
+                    )
+                )
+                scaled24 = values * 8_388_608.0
+                quant_24_hits += int(
+                    np.count_nonzero(
+                        np.abs(scaled24 - np.round(scaled24)) <= _QUANT_24_TOLERANCE
+                    )
+                )
+                quant_samples += values.size
+
         # Освобождаем уже прочитанный буфер (но не «заглядывая» в будущее).
         cut = min(next_spec, next_sg) - buffer_start
-        cut = min(cut, buffer.size)
+        cut = min(cut, buffer.shape[0])
         if cut > 0:
-            buffer = buffer[cut:]
+            buffer = buffer[cut:, :]
             buffer_start += cut
 
         read_frames += block.shape[0]
-        peak = max(peak, float(np.max(np.abs(mono))))
-        sum_squares += float(np.dot(mono, mono))
+        peak = max(peak, float(np.max(np.abs(block))))
+        sum_squares += float(np.sum(block.astype(np.float64) ** 2))
         if progress is not None:
             progress(min(1.0, read_frames / total_frames))
 
@@ -194,7 +234,16 @@ def compute_spectra(
     freqs_spec = np.fft.rfftfreq(n_fft_spec, d=1.0 / sample_rate)
     levels_db = 10.0 * np.log10(np.maximum(mean_power, 1e-24))
 
-    rms = math.sqrt(sum_squares / max(1, read_frames))
+    grid_bits = None
+    if quant_samples >= _QUANT_MIN_SAMPLES:
+        fraction_16 = quant_16_hits / quant_samples
+        fraction_24 = quant_24_hits / quant_samples
+        if fraction_16 >= 0.995 and fraction_24 >= 0.995:
+            grid_bits = 16
+        elif fraction_24 >= 0.995:
+            grid_bits = 24
+
+    rms = math.sqrt(sum_squares / max(1, read_frames * max(1, file.channels)))
     spectrum = SpectrumData(
         freqs=freqs_spec,
         levels_db=levels_db,
@@ -203,6 +252,7 @@ def compute_spectra(
         nyquist=sample_rate / 2.0,
         rms_db=float(_db(max(rms, 1e-12))),
         peak_db=float(_db(max(peak, 1e-12))),
+        grid_bits=grid_bits,
     )
 
     # --- Итоговая спектрограмма ------------------------------------------

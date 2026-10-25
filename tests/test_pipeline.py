@@ -49,6 +49,46 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.detection.verdict, "lossless", result.detection)
         self.assertIsNone(result.detection.cutoff_hz)
         self.assertEqual(result.meta.sample_rate, SR)
+        self.assertGreater(result.detection.time_frames, 0)
+        self.assertGreater(result.detection.time_edge_p10_hz or 0.0, SR / 2.0 - 1_000.0)
+        self.assertEqual(result.spectrum.grid_bits, 24)
+        self.assertIsNone(result.detection.effective_bits)
+
+    def test_antiphase_stereo_is_analyzed(self) -> None:
+        base = _noise(seed=12)
+        stereo = np.column_stack((base, -base))
+        path = self.tmp / "antiphase.wav"
+        sf.write(str(path), stereo, SR, subtype="PCM_24")
+        result = analyze_file(str(path))
+        self.assertEqual(result.detection.verdict, "lossless", result.detection)
+        self.assertGreater(result.spectrum.rms_db, -30.0)
+
+    def test_effective_bit_depth_is_reported(self) -> None:
+        base = _noise(seed=14)
+        quantized_16 = np.round(base * 32_768) / 32_768
+        path = self.tmp / "16bit_in_24bit.flac"
+        sf.write(str(path), quantized_16, SR, subtype="PCM_24")
+        result = analyze_file(str(path))
+        self.assertEqual(result.spectrum.grid_bits, 16)
+        self.assertEqual(result.detection.effective_bits, 16)
+        self.assertTrue(
+            any("Эффективная разрядность" in note for note in result.detection.notes)
+        )
+
+    def test_partially_filtered_file_is_inconclusive(self) -> None:
+        base = _noise(seed=15)
+        mixed = base.copy()
+        second = mixed[base.size // 2 :]
+        spectrum = np.fft.rfft(second)
+        freqs = np.fft.rfftfreq(second.size, d=1.0 / SR)
+        spectrum[freqs > 18_000.0] = 0.0
+        mixed[base.size // 2 :] = np.fft.irfft(spectrum, n=second.size)
+        path = self.tmp / "mixed_bandwidth.wav"
+        _write(path, mixed, SR)
+        result = analyze_file(str(path))
+        self.assertEqual(result.detection.verdict, "inconclusive", result.detection)
+        self.assertLess(result.detection.time_edge_p10_hz or 0.0, 19_000.0)
+        self.assertIn("неоднород", result.detection.reason)
 
     def test_unicode_filename_is_analyzed(self) -> None:
         folder = self.tmp / "Любимое 💙"
@@ -124,6 +164,7 @@ class PipelineTests(unittest.TestCase):
         self.assertIsNotNone(result.detection.cutoff_hz)
         self.assertAlmostEqual(result.detection.cutoff_hz / 1000.0, 18.0, delta=0.35)
         self.assertGreater(result.detection.drop_db or 0.0, 30.0)
+        self.assertGreaterEqual(result.detection.time_consistency or 0.0, 0.8)
         self.assertEqual(result.spectrogram.levels_db.ndim, 2)
 
     def test_upscaled_cd_to_96k_is_detected(self) -> None:

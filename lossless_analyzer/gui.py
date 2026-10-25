@@ -700,11 +700,21 @@ class MainWindow(QMainWindow):
                 and detection.transition_width_hz >= 100.0
                 else ""
             )
+            timing = (
+                f" · срез в {detection.time_consistency:.0%} кадров"
+                if detection.time_consistency is not None
+                else ""
+            )
             parts.append(
-                f"<b>Срез:</b> {format_khz(detection.cutoff_hz)}{drop}{transition}"
+                f"<b>Срез:</b> {format_khz(detection.cutoff_hz)}"
+                f"{drop}{transition}{timing}"
             )
         if detection.estimated_source:
             parts.append(f"<b>Источник:</b> {escape(detection.estimated_source)}")
+        if detection.effective_bits is not None:
+            parts.append(
+                f"<b>Разрядность:</b> фактически ≈{detection.effective_bits} бит"
+            )
         if result.meta.is_lossy:
             parts.append("<b>Контейнер:</b> с потерями")
         line = " &nbsp;·&nbsp; ".join(parts)

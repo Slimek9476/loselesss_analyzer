@@ -27,7 +27,7 @@ from typing import Literal
 import numpy as np
 from scipy.ndimage import median_filter, uniform_filter1d
 
-from .dsp import SpectrumData
+from .dsp import SpectrogramData, SpectrumData
 from .formatting import format_khz
 from .loader import AudioMeta
 
@@ -41,6 +41,15 @@ _MIN_SHARPNESS = 0.55
 _MAX_PLATEAU_STD_DB = 5.0
 _MIN_PRE_LEVEL_DB = -46.0
 _MIN_POST_WIDTH_HZ = 500.0
+
+# Анализ во времени: порог верхней границы кадра и допуски.
+_TIME_MIN_NYQUIST_HZ = 15_000.0
+_TIME_MIN_REF_DB = -60.0
+_TIME_EDGE_REL_DB = -55.0
+_TIME_MIN_FRAMES = 5
+_TIME_SMOOTH_HZ = 250.0
+_TIME_TOLERANCE_HZ = 2_000.0
+_TIME_MARGIN_HZ = 1_500.0
 
 _UPSCALE_ORIGINS: tuple[tuple[float, str], ...] = (
     (22_050.0, "44.1 кГц"),
@@ -65,6 +74,13 @@ class DetectionResult:
     confidence: float = 0.0
     hf_level_db: float | None = None
     estimated_source: str | None = None
+    effective_bits: int | None = None
+    time_frames: int = 0
+    time_edge_median_hz: float | None = None
+    time_edge_p10_hz: float | None = None
+    time_edge_p90_hz: float | None = None
+    time_consistency: float | None = None
+    time_above_fraction: float | None = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -91,6 +107,19 @@ class _SoftCutoff:
     transition_width_hz: float
     estimated_source: str
     confidence: float
+
+
+@dataclass
+class _TimeEvidence:
+    """Распределение верхней границы спектра по громким кадрам."""
+
+    frames: int
+    edge_median_hz: float
+    edge_p10_hz: float
+    edge_p90_hz: float
+    consistency: float | None = None
+    above_fraction: float | None = None
+    below_fraction: float | None = None
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
@@ -126,6 +155,82 @@ def _smooth_spectrum(
     average_size = max(1, int(round(width_hz * 2.2 / df)))
     smoothed = uniform_filter1d(smoothed, size=average_size, mode="nearest")
     return smoothed
+
+
+def _frame_edges(
+    spectrogram: SpectrogramData | None,
+    cutoff_hz: float | None = None,
+) -> _TimeEvidence | None:
+    """Считает верхнюю границу спектра для каждого громкого кадра.
+
+    Граница — последняя частота, где уровень кадра не ниже −55 дБ
+    относительно его же полосы 1–4 кГц. Медиана и перцентили показывают,
+    постоянен ли срез во времени (VBR, монтаж, разные участки).
+    """
+    if spectrogram is None:
+        return None
+    data = spectrogram.levels_db
+    freqs = spectrogram.freqs
+    nyquist = float(spectrogram.nyquist)
+    if (
+        data.ndim != 2
+        or data.shape[1] < _TIME_MIN_FRAMES
+        or freqs.size != data.shape[0]
+        or nyquist < _TIME_MIN_NYQUIST_HZ
+    ):
+        return None
+
+    df = float(freqs[1] - freqs[0]) if freqs.size > 1 else 1.0
+    smooth_size = max(3, int(round(_TIME_SMOOTH_HZ / df)))
+    if smooth_size % 2 == 0:
+        smooth_size += 1
+    smoothed = uniform_filter1d(data, size=smooth_size, axis=0, mode="nearest")
+
+    ref_lo, ref_hi = 1_000.0, min(4_000.0, nyquist * 0.55)
+    if ref_hi - ref_lo < 500.0:
+        return None
+    r0 = int(np.searchsorted(freqs, ref_lo, side="left"))
+    r1 = int(np.searchsorted(freqs, ref_hi, side="right"))
+    if r1 - r0 < 3:
+        return None
+    frame_ref = np.median(smoothed[r0:r1, :], axis=0)
+    valid = np.isfinite(frame_ref) & (frame_ref >= _TIME_MIN_REF_DB)
+    if int(valid.sum()) < _TIME_MIN_FRAMES:
+        return None
+
+    relative = smoothed - frame_ref[None, :]
+    search_lo = min(_MIN_CUTOFF_HZ, nyquist * 0.55)
+    search_hi = nyquist - max(200.0, 0.01 * nyquist)
+    lo = int(np.searchsorted(freqs, search_lo, side="left"))
+    hi = int(np.searchsorted(freqs, search_hi, side="right"))
+    if hi - lo < 3:
+        return None
+
+    band = relative[lo:hi, valid]
+    mask = band >= _TIME_EDGE_REL_DB
+    has_edge = mask.any(axis=0)
+    if int(has_edge.sum()) < _TIME_MIN_FRAMES:
+        return None
+    last = mask.shape[0] - 1 - np.argmax(mask[::-1, :], axis=0)
+    edges = freqs[lo + last[has_edge]]
+    edges = edges[edges >= search_lo]
+    if edges.size < _TIME_MIN_FRAMES:
+        return None
+
+    p10, median, p90 = np.percentile(edges, [10.0, 50.0, 90.0])
+    evidence = _TimeEvidence(
+        frames=int(edges.size),
+        edge_median_hz=float(median),
+        edge_p10_hz=float(p10),
+        edge_p90_hz=float(p90),
+    )
+    if cutoff_hz is not None:
+        evidence.consistency = float(
+            np.mean(np.abs(edges - cutoff_hz) <= _TIME_TOLERANCE_HZ)
+        )
+        evidence.above_fraction = float(np.mean(edges > cutoff_hz + _TIME_MARGIN_HZ))
+        evidence.below_fraction = float(np.mean(edges < cutoff_hz - _TIME_MARGIN_HZ))
+    return evidence
 
 
 def _edge_metrics(
@@ -438,7 +543,96 @@ def _source_sentence(source: str) -> str:
     return f"Вероятно, исходник — {source}."
 
 
-def detect(spectrum: SpectrumData, meta: AudioMeta) -> DetectionResult:
+def _time_note(evidence: _TimeEvidence, cutoff_hz: float | None) -> str:
+    """Описывает стабильность верхней границы по кадрам."""
+    span = (
+        f"{format_khz(evidence.edge_p10_hz, 1)}–{format_khz(evidence.edge_p90_hz, 1)}"
+    )
+    if cutoff_hz is not None and evidence.consistency is not None:
+        if evidence.consistency >= 0.75:
+            text = (
+                f"Срез подтверждён во времени: {evidence.consistency:.0%} "
+                f"из {evidence.frames} громких кадров (медиана "
+                f"{format_khz(evidence.edge_median_hz, 1)}, p10–p90 {span})."
+            )
+        else:
+            text = (
+                f"Срез непостоянен: с найденной частотой совпало "
+                f"{evidence.consistency:.0%} из {evidence.frames} громких кадров "
+                f"(медиана {format_khz(evidence.edge_median_hz, 1)}, "
+                f"p10–p90 {span})."
+            )
+        if (evidence.above_fraction or 0.0) > 0.15:
+            text += (
+                f" В {evidence.above_fraction:.0%} кадров есть энергия выше "
+                "найденного среза."
+            )
+        if (evidence.below_fraction or 0.0) > 0.25:
+            text += (
+                f" В {evidence.below_fraction:.0%} кадров верхняя граница заметно ниже."
+            )
+        return text
+    return (
+        f"По кадрам верхняя граница: медиана "
+        f"{format_khz(evidence.edge_median_hz, 1)}, p10–p90 {span} "
+        f"({evidence.frames} громких кадров)."
+    )
+
+
+def _time_confidence_delta(evidence: _TimeEvidence | None) -> float:
+    """Небольшая поправка уверенности по временной согласованности."""
+    if evidence is None or evidence.consistency is None:
+        return 0.0
+    delta = 0.08 * (evidence.consistency - 0.5)
+    spread = evidence.edge_p90_hz - evidence.edge_p10_hz
+    if spread > _TIME_TOLERANCE_HZ:
+        delta -= 0.05 * _clamp((spread - _TIME_TOLERANCE_HZ) / 3_000.0)
+    if evidence.above_fraction is not None:
+        delta -= 0.12 * _clamp((evidence.above_fraction - 0.15) / 0.5)
+    if evidence.below_fraction is not None:
+        delta -= 0.06 * _clamp((evidence.below_fraction - 0.25) / 0.5)
+    return delta
+
+
+def _apply_time_evidence(
+    result: DetectionResult, evidence: _TimeEvidence | None
+) -> DetectionResult:
+    """Переносит временные метрики в результат для GUI и отчёта."""
+    if evidence is None:
+        return result
+    result.time_frames = evidence.frames
+    result.time_edge_median_hz = evidence.edge_median_hz
+    result.time_edge_p10_hz = evidence.edge_p10_hz
+    result.time_edge_p90_hz = evidence.edge_p90_hz
+    result.time_consistency = evidence.consistency
+    result.time_above_fraction = evidence.above_fraction
+    return result
+
+
+def _apply_effective_bits(
+    result: DetectionResult, spectrum: SpectrumData, meta: AudioMeta
+) -> DetectionResult:
+    """Отмечает недозаполненную разрядность целочисленного PCM-контейнера."""
+    if (
+        spectrum.grid_bits is None
+        or meta.bit_depth is None
+        or meta.bit_depth <= spectrum.grid_bits
+        or not meta.subtype.upper().startswith("PCM")
+    ):
+        return result
+    result.effective_bits = spectrum.grid_bits
+    result.notes.append(
+        f"Эффективная разрядность ≈{spectrum.grid_bits} бит: контейнер "
+        f"{meta.bit_depth} бит, но младшие биты не используются."
+    )
+    return result
+
+
+def detect(
+    spectrum: SpectrumData,
+    meta: AudioMeta,
+    spectrogram: SpectrogramData | None = None,
+) -> DetectionResult:
     """Главная функция детекции. Возвращает вердикт и подробности."""
     freqs = spectrum.freqs
     levels = spectrum.levels_db
@@ -488,9 +682,11 @@ def detect(spectrum: SpectrumData, meta: AudioMeta) -> DetectionResult:
         300.0,
     )
     soft = None if edge is not None else _find_soft_cutoff(freqs, relative, meta)
+    time_evidence = _frame_edges(spectrogram) if edge is None and soft is None else None
 
     if edge is not None:
         cutoff = edge.cutoff_hz
+        time_evidence = _frame_edges(spectrogram, cutoff)
         confidence = _clamp(
             0.45 * _clamp((edge.wide_drop - 20.0) / 30.0)
             + 0.30 * _clamp((edge.edge_drop - 10.0) / 25.0)
@@ -498,6 +694,9 @@ def detect(spectrum: SpectrumData, meta: AudioMeta) -> DetectionResult:
             + 0.10 * _clamp((edge.pre_level + 45.0) / 20.0),
             0.30,
             0.99,
+        )
+        confidence = _clamp(
+            confidence + _time_confidence_delta(time_evidence), 0.25, 0.99
         )
         plateau_text = _floor_text(edge.post_level)
         notes.append(
@@ -510,6 +709,8 @@ def detect(spectrum: SpectrumData, meta: AudioMeta) -> DetectionResult:
                 f"Для {meta.sample_rate / 1000.0:.1f} кГц честный спектр должен "
                 f"доходить до {nyquist / 1000.0:.1f} кГц."
             )
+        if time_evidence is not None:
+            notes.append(_time_note(time_evidence, cutoff))
         estimated = _guess_source(cutoff, meta)
 
         result = DetectionResult(
@@ -528,9 +729,11 @@ def detect(spectrum: SpectrumData, meta: AudioMeta) -> DetectionResult:
             estimated_source=estimated,
             notes=notes,
         )
+        _apply_time_evidence(result, time_evidence)
     elif soft is not None:
         cutoff = soft.cutoff_hz
         nyquist_khz = nyquist / 1000.0
+        time_evidence = _frame_edges(spectrogram, cutoff)
         notes.append(
             f"Выше среза уровень стабилен: {soft.floor_level:.0f} дБ "
             f"(σ {soft.floor_std:.1f} дБ), переход ~"
@@ -546,6 +749,11 @@ def detect(spectrum: SpectrumData, meta: AudioMeta) -> DetectionResult:
             "Мягкая полка может быть следствием ресемплера (SRC) или "
             "намеренного lowpass/мастеринга."
         )
+        if time_evidence is not None:
+            notes.append(_time_note(time_evidence, cutoff))
+        confidence = _clamp(
+            soft.confidence + _time_confidence_delta(time_evidence), 0.45, 0.95
+        )
         result = DetectionResult(
             verdict="fake",
             headline="FAKE LOSSLESS (UPSCALE)",
@@ -559,34 +767,61 @@ def detect(spectrum: SpectrumData, meta: AudioMeta) -> DetectionResult:
             drop_db=soft.drop_db,
             plateau_level_db=soft.floor_level,
             transition_width_hz=soft.transition_width_hz,
-            confidence=soft.confidence,
+            confidence=confidence,
             hf_level_db=top_level,
             estimated_source=soft.estimated_source,
             notes=notes,
         )
+        _apply_time_evidence(result, time_evidence)
     elif top_level is None:
         result = DetectionResult(
             verdict="inconclusive",
             headline="INCONCLUSIVE",
             reason="Не удалось измерить высокочастотную область спектра.",
         )
+        _apply_time_evidence(result, time_evidence)
     elif top_level >= -45.0:
         confidence = _clamp(0.55 + (top_level + 45.0) / 45.0 * 0.4, 0.55, 0.98)
         notes.append(
             f"Уровень у частоты Найквиста: {top_level:.0f} дБ относительно средних частот."
         )
         notes.append("Плавного спада или резкого обрыва в верхней полосе не найдено.")
-        result = DetectionResult(
-            verdict="lossless",
-            headline="TRUE LOSSLESS",
-            reason=(
-                "Резких срезов не найдено: спектр сохраняет энергию "
-                "вплоть до частоты Найквиста."
-            ),
-            confidence=confidence,
-            hf_level_db=top_level,
-            notes=notes,
+        mixed_bandwidth = (
+            time_evidence is not None and time_evidence.edge_p10_hz < nyquist - 3_000.0
         )
+        if time_evidence is not None:
+            notes.append(_time_note(time_evidence, None))
+        if mixed_bandwidth:
+            notes.append(
+                "Средний спектр доходит до верха, но в части кадров граница "
+                "заметно ниже — возможен фильтрованный фрагмент, монтаж или VBR."
+            )
+            result = DetectionResult(
+                verdict="inconclusive",
+                headline="INCONCLUSIVE",
+                reason=(
+                    "Спектр неоднороден: в части файла верхняя граница заметно "
+                    f"ниже Найквиста (p10 {format_khz(time_evidence.edge_p10_hz, 1)}). "
+                    "Средний спектр скрывает этот участок, поэтому однозначный "
+                    "вердикт невозможен."
+                ),
+                confidence=0.35,
+                hf_level_db=top_level,
+                notes=notes,
+            )
+        else:
+            result = DetectionResult(
+                verdict="lossless",
+                headline="TRUE LOSSLESS",
+                reason=(
+                    "Резких срезов не найдено: спектр сохраняет энергию "
+                    "вплоть до частоты Найквиста."
+                ),
+                confidence=confidence,
+                hf_level_db=top_level,
+                notes=notes,
+            )
+        _apply_time_evidence(result, time_evidence)
     else:
         if spectrum.rms_db < -45:
             reason = (
@@ -606,6 +841,8 @@ def detect(spectrum: SpectrumData, meta: AudioMeta) -> DetectionResult:
         notes.append(
             f"Уровень у частоты Найквиста: {top_level:.0f} дБ относительно средних частот."
         )
+        if time_evidence is not None:
+            notes.append(_time_note(time_evidence, None))
         result = DetectionResult(
             verdict="inconclusive",
             headline="INCONCLUSIVE",
@@ -614,5 +851,7 @@ def detect(spectrum: SpectrumData, meta: AudioMeta) -> DetectionResult:
             hf_level_db=top_level,
             notes=notes,
         )
+        _apply_time_evidence(result, time_evidence)
 
+    result = _apply_effective_bits(result, spectrum, meta)
     return _apply_lossy_override(result, meta)

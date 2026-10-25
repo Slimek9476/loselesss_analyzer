@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 
 from lossless_analyzer.detector import detect
-from lossless_analyzer.dsp import SpectrumData
+from lossless_analyzer.dsp import SpectrogramData, SpectrumData
 from lossless_analyzer.loader import AudioMeta
 
 
@@ -70,6 +70,33 @@ def _soft_spectrum(
     levels[freqs > end_hz] = floor_db
     spectrum.levels_db = levels
     return spectrum
+
+
+def _time_spectrogram(
+    sample_rate: int,
+    cutoffs: list[float | None],
+    floor_db: float = -100.0,
+    seed: int = 13,
+) -> SpectrogramData:
+    """Спектрограмма с разным срезом в разных кадрах."""
+    n_fft = 2048
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sample_rate)
+    base = -30.0 - 6.0 * np.log10(np.maximum(freqs, 80.0) / 1000.0)
+    rng = np.random.default_rng(seed)
+    columns = []
+    for cutoff in cutoffs:
+        levels = base.copy()
+        if cutoff is not None:
+            levels[freqs > cutoff] = floor_db
+        columns.append(levels + rng.normal(0.0, 0.8, levels.size))
+    matrix = np.column_stack(columns).astype(np.float32)
+    return SpectrogramData(
+        times=np.arange(len(cutoffs), dtype=np.float64) * 0.05,
+        freqs=freqs,
+        levels_db=matrix,
+        max_db=float(matrix.max()),
+        nyquist=sample_rate / 2.0,
+    )
 
 
 class DetectorTests(unittest.TestCase):
@@ -135,6 +162,34 @@ class DetectorTests(unittest.TestCase):
         )
         result = detect(spectrum, _meta(48_000))
         self.assertNotEqual(result.verdict, "fake")
+
+    def test_stable_cutoff_is_confirmed_over_time(self) -> None:
+        spectrum = _spectrum(cutoff=18_000.0)
+        spectrogram = _time_spectrogram(44_100, [18_000.0] * 40)
+        result = detect(spectrum, _meta(44_100), spectrogram)
+        self.assertEqual(result.verdict, "fake")
+        self.assertGreaterEqual(result.time_consistency or 0.0, 0.9)
+        self.assertLess(abs((result.time_edge_p90_hz or 0.0) - 18_000.0), 800.0)
+        self.assertTrue(any("времени" in note for note in result.notes))
+
+    def test_variable_cutoff_gets_temporal_warning(self) -> None:
+        spectrum = _spectrum(cutoff=18_000.0)
+        cutoffs = [15_500.0 if i % 2 else 21_000.0 for i in range(40)]
+        spectrogram = _time_spectrogram(44_100, cutoffs)
+        result = detect(spectrum, _meta(44_100), spectrogram)
+        self.assertEqual(result.verdict, "fake")
+        self.assertIsNotNone(result.time_consistency)
+        self.assertLess(result.time_consistency, 0.75)
+        self.assertGreater(result.time_above_fraction or 0.0, 0.25)
+        self.assertTrue(any("непостоян" in note for note in result.notes))
+
+    def test_partially_full_band_file_is_inconclusive(self) -> None:
+        spectrum = _spectrum()
+        spectrogram = _time_spectrogram(44_100, [None] * 25 + [18_000.0] * 15)
+        result = detect(spectrum, _meta(44_100), spectrogram)
+        self.assertEqual(result.verdict, "inconclusive", result)
+        self.assertLess(result.time_edge_p10_hz or 0.0, 19_000.0)
+        self.assertIn("неоднород", result.reason)
 
     def test_lossy_container_overrides_verdict(self) -> None:
         spectrum = _spectrum(cutoff=18_000.0)
