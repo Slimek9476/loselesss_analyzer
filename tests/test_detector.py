@@ -53,6 +53,25 @@ def _spectrum(
     )
 
 
+def _soft_spectrum(
+    sample_rate: int,
+    start_hz: float,
+    end_hz: float,
+    floor_db: float = -120.0,
+) -> SpectrumData:
+    """Строит спектр с плавным срезом и ровной полкой выше него."""
+    spectrum = _spectrum(sample_rate=sample_rate)
+    freqs = spectrum.freqs
+    levels = np.full_like(freqs, -30.0)
+    mask = (freqs >= start_hz) & (freqs <= end_hz)
+    levels[mask] = -30.0 - 90.0 * 0.5 * (
+        1.0 - np.cos(np.pi * (freqs[mask] - start_hz) / (end_hz - start_hz))
+    )
+    levels[freqs > end_hz] = floor_db
+    spectrum.levels_db = levels
+    return spectrum
+
+
 class DetectorTests(unittest.TestCase):
     def test_brickwall_is_detected(self) -> None:
         spectrum = _spectrum(cutoff=18_000.0)
@@ -87,6 +106,35 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(result.verdict, "fake")
         self.assertAlmostEqual(result.cutoff_hz / 1000.0, 22.05, delta=0.3)
         self.assertIn("44.1", result.estimated_source or "")
+
+    def test_soft_48k_cutoff_is_detected(self) -> None:
+        spectrum = _soft_spectrum(48_000, 20_000.0, 23_000.0)
+        result = detect(spectrum, _meta(48_000))
+        self.assertEqual(result.verdict, "fake", result)
+        self.assertIsNotNone(result.cutoff_hz)
+        self.assertGreater(result.cutoff_hz, 20_500.0)
+        self.assertLess(result.cutoff_hz, 23_500.0)
+        self.assertIsNotNone(result.estimated_source)
+
+    def test_soft_44k_cutoff_is_detected(self) -> None:
+        spectrum = _soft_spectrum(44_100, 16_000.0, 18_500.0)
+        result = detect(spectrum, _meta(44_100))
+        self.assertEqual(result.verdict, "fake", result)
+        self.assertIsNotNone(result.cutoff_hz)
+        self.assertGreater(result.cutoff_hz, 16_000.0)
+        self.assertLess(result.cutoff_hz, 19_000.0)
+        self.assertIn("MP3", result.estimated_source or "")
+
+    def test_natural_rolloff_is_not_a_cutoff(self) -> None:
+        spectrum = _spectrum(sample_rate=48_000)
+        freqs = spectrum.freqs
+        spectrum.levels_db = np.interp(
+            freqs,
+            [0.0, 10_000.0, 24_000.0],
+            [-30.0, -30.0, -80.0],
+        )
+        result = detect(spectrum, _meta(48_000))
+        self.assertNotEqual(result.verdict, "fake")
 
     def test_lossy_container_overrides_verdict(self) -> None:
         spectrum = _spectrum(cutoff=18_000.0)

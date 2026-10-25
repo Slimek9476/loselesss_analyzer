@@ -8,13 +8,15 @@ Lossy-кодеки (MP3, AAC, Vorbis и т.п.) физически не пере
 файл пересохранить во FLAC/WAV, обрыв никуда не денется.
 
 Алгоритм:
-1. Переводим спектр в дБ относительно средних частот (1–8 кГц).
+1. Переводим спектр в дБ относительно средних частот (1–4 кГц).
 2. Сглаживаем спектр, чтобы убрать узкие тональные пики.
-3. Для каждой частоты-кандидата измеряем перепад между полосами до и после
-   неё, «локальную» крутизну обрыва и разброс уровня на «полке» после среза.
-4. Лучший кандидат проверяется по порогам. Если обрыв найден — вердикт FAKE.
-5. Если обрыва нет, оцениваем наличие энергии у частоты Найквиста. Есть
-   энергия — TRUE LOSSLESS; тихо/темно — INCONCLUSIVE.
+3. Ищем резкий обрыв: перепад между полосами до и после кандидата, локальную
+   крутизну и разброс уровня на «полке».
+4. Если резкого обрыва нет, ищем мягкий срез: устойчивую низкоуровневую полку
+   у верхней границы и заметный спад перед ней (SRC, lossy, lowpass).
+5. Для найденного среза оцениваем источник (MP3/AAC или апскейл).
+6. Если среза нет, проверяем энергию у частоты Найквиста: есть — TRUE
+   LOSSLESS; тихо/темно — INCONCLUSIVE.
 """
 
 from __future__ import annotations
@@ -39,7 +41,6 @@ _MIN_SHARPNESS = 0.55
 _MAX_PLATEAU_STD_DB = 5.0
 _MIN_PRE_LEVEL_DB = -46.0
 _MIN_POST_WIDTH_HZ = 500.0
-_BAND_LIMIT_THRESHOLD_DB = -50.0
 
 _UPSCALE_ORIGINS: tuple[tuple[float, str], ...] = (
     (22_050.0, "44.1 кГц"),
@@ -60,6 +61,7 @@ class DetectionResult:
     cutoff_hz: float | None = None
     drop_db: float | None = None
     plateau_level_db: float | None = None
+    transition_width_hz: float | None = None
     confidence: float = 0.0
     hf_level_db: float | None = None
     estimated_source: str | None = None
@@ -78,13 +80,16 @@ class _EdgeMetrics:
 
 
 @dataclass
-class _BandLimit:
-    """Мягкое ограничение полосы (типично для апскейла с SRC-фильтром)."""
+class _SoftCutoff:
+    """Мягкий срез/полка: SRC-апскейл, lossy-источник или намеренный lowpass."""
 
-    edge_hz: float
+    cutoff_hz: float
     pre_level: float
-    empty_level: float
-    source_label: str
+    floor_level: float
+    drop_db: float
+    floor_std: float
+    transition_width_hz: float
+    estimated_source: str
     confidence: float
 
 
@@ -229,6 +234,8 @@ def _match_upscale_source(edge_hz: float) -> tuple[str, float] | None:
         label, reference = "64 кГц", 32_000.0
     elif edge_hz <= 46_000.0:
         label, reference = "88.2/96 кГц", 45_000.0
+    elif edge_hz <= 49_000.0:
+        label, reference = "88.2/96 кГц", 48_000.0
     else:
         return None
     if abs(edge_hz - reference) > 2_500.0:
@@ -236,82 +243,135 @@ def _match_upscale_source(edge_hz: float) -> tuple[str, float] | None:
     return label, reference
 
 
-def _find_band_limit(
+def _describe_soft_source(cutoff_hz: float, meta: AudioMeta) -> str:
+    """Описывает вероятный источник для мягкого среза."""
+    sample_rate = meta.sample_rate
+    if sample_rate > 48_000:
+        match = _match_upscale_source(cutoff_hz)
+        if match is not None:
+            label, reference = match
+            if sample_rate > reference * 2.05:
+                return f"апскейл с {label} (спектр ограничен ~{format_khz(cutoff_hz)})"
+        if cutoff_hz <= 22_000.0:
+            return (
+                f"апскейл с lossy-источника ({_guess_bitrate(cutoff_hz, sample_rate)})"
+            )
+        return f"срез спектра в верхней части диапазона (~{format_khz(cutoff_hz)})"
+
+    if sample_rate >= 47_000:
+        if cutoff_hz >= 21_800.0:
+            return "возможный апскейл с 44.1 кГц"
+        return _guess_bitrate(cutoff_hz, sample_rate)
+    return _guess_bitrate(cutoff_hz, sample_rate)
+
+
+def _find_soft_cutoff(
     freqs: np.ndarray,
     relative_db: np.ndarray,
     meta: AudioMeta,
-) -> _BandLimit | None:
-    """Ищет «мягкий» апскейл: контейнер hi-res, а спектр обрывается заметно ниже.
+) -> _SoftCutoff | None:
+    """Ищет мягкий срез и ровную низкоуровневую полку выше него.
 
-    Некоторые конвертеры (SRC) делают срез не мгновенным, а растянутым на
-    несколько кГц. Детектор «кирпичной стены» такой случай пропускает, поэтому
-    дополнительно проверяем, где заканчивается полоса с реальной энергией.
+    В отличие от «кирпичной стены», здесь переход может занимать несколько
+    кГц (SRC, намеренный lowpass, некоторые lossy-кодеки). Признак среза —
+    устойчивая полка, которая заметно ниже опорного уровня и не имеет
+    наклона, а не мгновенный скачок.
     """
-    sample_rate = meta.sample_rate
-    if sample_rate <= 48_000:
+    nyquist = float(freqs[-1])
+    if nyquist < 16_000.0:
         return None
-    nyquist = sample_rate / 2.0
+
     df = float(freqs[1] - freqs[0])
-    window = max(3, int(round(1000.0 / df)))
+    window = max(3, int(round(350.0 / df)))
     if window % 2 == 0:
         window += 1
-    band_median = median_filter(relative_db, size=window, mode="nearest")
+    smoothed = median_filter(relative_db, size=window, mode="nearest")
 
-    # Верхняя граница полосы: последняя точка, где медиана ещё выше порога.
-    index = band_median.size - 1
-    while index > 0 and band_median[index] < _BAND_LIMIT_THRESHOLD_DB:
-        index -= 1
-    edge = float(freqs[index])
-    if edge < 15_000.0:
-        return None
-
-    empty = _median_band(
+    pre = _median_band(
         freqs,
-        band_median,
-        edge + 2000.0,
-        min(nyquist * 0.98, edge + 12_000.0),
-        1000.0,
+        smoothed,
+        9_000.0,
+        min(14_000.0, nyquist * 0.70),
+        500.0,
     )
-    if empty is None or empty > -55.0:
+    if pre is None or pre < _MIN_PRE_LEVEL_DB:
         return None
 
-    pre = _median_band(freqs, band_median, edge - 3000.0, edge - 500.0, 800.0)
-    if pre is None or pre < -40.0:
+    # Полка у верхней границы диапазона.
+    floor_lo = max(nyquist - 700.0, nyquist * 0.90)
+    floor_hi = nyquist - 80.0
+    floor = _median_band(freqs, smoothed, floor_lo, floor_hi, 250.0)
+    if floor is None:
         return None
 
-    # Контейнер должен быть существенно шире исходного диапазона.
-    if sample_rate < 3.2 * edge:
+    i0 = int(np.searchsorted(freqs, floor_lo, side="left"))
+    i1 = int(np.searchsorted(freqs, floor_hi, side="right"))
+    if i1 - i0 < 3:
+        return None
+    floor_std = float(np.std(smoothed[i0:i1]))
+    if floor > pre - 30.0 or floor_std > 5.0:
         return None
 
-    match = _match_upscale_source(edge)
-    if match is None:
-        return None
-    label, reference = match
+    if i1 - i0 >= 8:
+        slope = float(np.polyfit(freqs[i0:i1], smoothed[i0:i1], 1)[0] * 1_000.0)
+        if abs(slope) > 2.5:
+            return None
+    else:
+        slope = 0.0
 
-    confidence = _clamp(
-        0.55
-        + 0.20 * _clamp((-55.0 - empty) / 25.0)
-        + 0.15 * _clamp(1.0 - abs(edge - reference) / 2500.0),
-        0.50,
-        0.88,
-    )
-    return _BandLimit(
-        edge_hz=edge,
+    # Конец перехода: последняя частота, где ещё есть энергия над полкой.
+    threshold = floor + max(6.0, 3.0 * floor_std)
+    above = np.where(smoothed >= threshold)[0]
+    if above.size < 3:
+        return None
+    cutoff = float(freqs[int(above[-1])])
+    if cutoff < 14_500.0 or cutoff > nyquist - 300.0:
+        return None
+
+    # Начало перехода — последняя точка в пределах 3 дБ от опорного уровня.
+    pre_idx = np.where((freqs < cutoff) & (smoothed >= pre - 3.0))[0]
+    start = float(freqs[int(pre_idx[-1])]) if pre_idx.size else cutoff
+    transition = max(0.0, cutoff - start)
+    if transition > 6_000.0:
+        return None
+
+    drop = pre - floor
+    if drop < 30.0:
+        return None
+
+    estimated_source = _describe_soft_source(cutoff, meta)
+    confidence = 0.52
+    confidence += 0.18 * _clamp((drop - 30.0) / 60.0)
+    confidence += 0.10 * _clamp((5.0 - floor_std) / 5.0)
+    confidence += 0.08 * _clamp((5.0 - abs(slope)) / 5.0)
+    if "апскейл с" in estimated_source and "возможный" not in estimated_source:
+        confidence += 0.07
+    if transition > 4_000.0:
+        confidence -= 0.08
+    confidence = _clamp(confidence, 0.50, 0.90)
+
+    return _SoftCutoff(
+        cutoff_hz=cutoff,
         pre_level=pre,
-        empty_level=empty,
-        source_label=label,
+        floor_level=floor,
+        drop_db=drop,
+        floor_std=floor_std,
+        transition_width_hz=transition,
+        estimated_source=estimated_source,
         confidence=confidence,
     )
 
 
 def _guess_bitrate(cutoff_hz: float, sample_rate: int) -> str:
     """Грубая оценка битрейта lossy-кодека по частоте среза."""
+    if sample_rate < 44_100:
+        return "MP3/AAC (битрейт не оценивается на низкой частоте дискретизации)"
     if sample_rate <= 48_000:
         normalized = cutoff_hz * 44_100.0 / sample_rate
     else:
         normalized = cutoff_hz
     if normalized < 15_000:
-        label = "~96 кбит/с"
+        label = "96 кбит/с"
     elif normalized < 16_000:
         label = "96–128 кбит/с"
     elif normalized < 17_000:
@@ -339,6 +399,8 @@ def _guess_source(cutoff_hz: float, meta: AudioMeta) -> str:
         return (
             f"апскейл с lossy-источника ({_guess_bitrate(cutoff_hz, meta.sample_rate)})"
         )
+    if 47_000 <= meta.sample_rate <= 48_000 and cutoff_hz >= 21_800:
+        return "возможный апскейл с 44.1 кГц"
     return _guess_bitrate(cutoff_hz, meta.sample_rate)
 
 
@@ -358,6 +420,22 @@ def _apply_lossy_override(result: DetectionResult, meta: AudioMeta) -> Detection
         0, "Файл изначально сжат с потерями — это не lossless-источник."
     )
     return result
+
+
+def _floor_text(level_db: float) -> str:
+    """Короткое описание уровня полки."""
+    if level_db < -120.0:
+        return "ниже −120 дБ"
+    return f"≈ {level_db:.0f} дБ"
+
+
+def _source_sentence(source: str) -> str:
+    """Согласует оценку источника с фразой в вердикте."""
+    if source.startswith("возможный "):
+        return f"Возможно, это {source.removeprefix('возможный ')}."
+    if "апскейл" in source:
+        return f"Похоже на {source}."
+    return f"Вероятно, исходник — {source}."
 
 
 def detect(spectrum: SpectrumData, meta: AudioMeta) -> DetectionResult:
@@ -409,7 +487,7 @@ def detect(spectrum: SpectrumData, meta: AudioMeta) -> DetectionResult:
         nyquist * 0.995,
         300.0,
     )
-    band_limit = None if edge is not None else _find_band_limit(freqs, relative, meta)
+    soft = None if edge is not None else _find_soft_cutoff(freqs, relative, meta)
 
     if edge is not None:
         cutoff = edge.cutoff_hz
@@ -421,23 +499,26 @@ def detect(spectrum: SpectrumData, meta: AudioMeta) -> DetectionResult:
             0.30,
             0.99,
         )
-        if edge.post_level < -120:
-            plateau_text = "ниже −120 дБ"
-        else:
-            plateau_text = f"≈ {edge.post_level:.0f} дБ"
+        plateau_text = _floor_text(edge.post_level)
         notes.append(
             f"Выше среза энергия падает на {edge.wide_drop:.0f} дБ "
             f"(полка {plateau_text} относительно средних частот)."
         )
         notes.append(f"Крутизна обрыва: {edge.edge_drop:.0f} дБ на участке ±0.4 кГц.")
+        if cutoff < nyquist - 1_000.0:
+            notes.append(
+                f"Для {meta.sample_rate / 1000.0:.1f} кГц честный спектр должен "
+                f"доходить до {nyquist / 1000.0:.1f} кГц."
+            )
         estimated = _guess_source(cutoff, meta)
 
         result = DetectionResult(
             verdict="fake",
             headline="FAKE LOSSLESS (UPSCALE)",
             reason=(
-                f"Обнаружен резкий срез на {format_khz(cutoff)} "
-                f"(перепад {edge.wide_drop:.0f} дБ)."
+                f"Обнаружен срез на частоте {format_khz(cutoff)}. "
+                f"{_source_sentence(estimated)} Спектр выше среза содержит только "
+                f"низкоуровневую полку ({plateau_text} относительно средних частот)."
             ),
             cutoff_hz=cutoff,
             drop_db=edge.wide_drop,
@@ -447,35 +528,40 @@ def detect(spectrum: SpectrumData, meta: AudioMeta) -> DetectionResult:
             estimated_source=estimated,
             notes=notes,
         )
-    elif band_limit is not None:
-        edge_khz = band_limit.edge_hz / 1000.0
+    elif soft is not None:
+        cutoff = soft.cutoff_hz
         nyquist_khz = nyquist / 1000.0
-        estimated = (
-            f"апскейл с {band_limit.source_label} "
-            f"(спектр ограничен ~{edge_khz:.1f} кГц)"
-        )
         notes.append(
-            f"Выше {edge_khz:.1f} кГц уровень падает до "
-            f"{band_limit.empty_level:.0f} дБ относительно средних частот, "
-            f"хотя частота Найквиста контейнера — {nyquist_khz:.1f} кГц."
+            f"Выше среза уровень стабилен: {soft.floor_level:.0f} дБ "
+            f"(σ {soft.floor_std:.1f} дБ), переход ~"
+            f"{soft.transition_width_hz / 1000.0:.1f} кГц."
         )
+        if cutoff < nyquist - 1_000.0:
+            notes.append(
+                f"Для {meta.sample_rate / 1000.0:.1f} кГц честный спектр должен "
+                f"доходить до {nyquist_khz:.1f} кГц; выше {cutoff / 1000.0:.1f} кГц "
+                "энергии нет."
+            )
         notes.append(
-            "Обрыв не резкий, поэтому, вероятно, применён ресемплер (SRC), "
-            "но высокочастотный диапазон исходника пуст."
+            "Мягкая полка может быть следствием ресемплера (SRC) или "
+            "намеренного lowpass/мастеринга."
         )
         result = DetectionResult(
             verdict="fake",
             headline="FAKE LOSSLESS (UPSCALE)",
             reason=(
-                f"Спектр обрывается около {format_khz(band_limit.edge_hz)} "
-                f"при частоте Найквиста {nyquist_khz:.1f} кГц — признак апскейла."
+                f"Спектр уходит в низкоуровневую полку около {format_khz(cutoff)} "
+                f"({_floor_text(soft.floor_level)} относительно средних частот), "
+                f"хотя частота Найквиста — {nyquist_khz:.1f} кГц. "
+                f"{_source_sentence(soft.estimated_source)}"
             ),
-            cutoff_hz=band_limit.edge_hz,
-            drop_db=band_limit.pre_level - band_limit.empty_level,
-            plateau_level_db=band_limit.empty_level,
-            confidence=band_limit.confidence,
+            cutoff_hz=cutoff,
+            drop_db=soft.drop_db,
+            plateau_level_db=soft.floor_level,
+            transition_width_hz=soft.transition_width_hz,
+            confidence=soft.confidence,
             hf_level_db=top_level,
-            estimated_source=estimated,
+            estimated_source=soft.estimated_source,
             notes=notes,
         )
     elif top_level is None:

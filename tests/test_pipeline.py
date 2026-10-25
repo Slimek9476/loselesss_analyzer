@@ -7,12 +7,14 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import soundfile as sf
 from scipy.signal import resample
 
 from lossless_analyzer.analysis import analyze_file
+from lossless_analyzer.loader import open_audio
 
 SR = 44_100
 SECONDS = 4.0
@@ -47,6 +49,66 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.detection.verdict, "lossless", result.detection)
         self.assertIsNone(result.detection.cutoff_hz)
         self.assertEqual(result.meta.sample_rate, SR)
+
+    def test_unicode_filename_is_analyzed(self) -> None:
+        folder = self.tmp / "Любимое 💙"
+        folder.mkdir()
+        path = folder / "Falling in Love 💙.flac"
+        _write(path, _noise(), SR)
+        result = analyze_file(str(path))
+        self.assertEqual(result.detection.verdict, "lossless", result.detection)
+        self.assertEqual(result.meta.sample_rate, SR)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg не найден")
+    def test_libsndfile_failure_falls_back_to_ffmpeg(self) -> None:
+        path = self.tmp / "Трек 💙.wav"
+        _write(path, _noise(), SR)
+        real_open = sf.SoundFile
+
+        def fake_open(target, *args, **kwargs):
+            if str(target) == str(path):
+                raise RuntimeError("Internal psf_fseek() failed.")
+            return real_open(target, *args, **kwargs)
+
+        with mock.patch("lossless_analyzer.loader.sf.SoundFile", side_effect=fake_open):
+            with open_audio(str(path)) as handle:
+                self.assertTrue(handle.used_fallback)
+                self.assertEqual(handle.meta.sample_rate, SR)
+            result = analyze_file(str(path))
+
+        self.assertEqual(result.detection.verdict, "lossless", result.detection)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg не найден")
+    def test_unicode_m4a_is_decoded_via_ffmpeg(self) -> None:
+        source = self.tmp / "source.wav"
+        m4a = self.tmp / "Трек 💙.m4a"
+        _write(source, _noise(seed=5), SR)
+        encode = subprocess.run(
+            [
+                shutil.which("ffmpeg"),
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                str(source),
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                str(m4a),
+            ],
+            capture_output=True,
+        )
+        if encode.returncode != 0:
+            self.skipTest("AAC-энкодер ffmpeg недоступен")
+
+        with open_audio(str(m4a)) as handle:
+            self.assertTrue(handle.used_fallback)
+            self.assertTrue(handle.meta.is_lossy)
+            self.assertEqual(handle.meta.sample_rate, SR)
+
+        result = analyze_file(str(m4a))
+        self.assertEqual(result.detection.verdict, "lossy", result.detection)
 
     def test_brickwalled_flac_is_detected(self) -> None:
         path = self.tmp / "fake_lossless.flac"

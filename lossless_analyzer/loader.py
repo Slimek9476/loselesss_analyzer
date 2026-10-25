@@ -112,16 +112,13 @@ class AudioHandle:
 
     file: sf.SoundFile
     meta: AudioMeta
+    used_fallback: bool = False
 
 
-def _decode_with_ffmpeg(source: Path, destination: Path) -> None:
-    """Декодирует любой поддерживаемый ffmpeg файл в float32 WAV без потерь."""
-    exe = shutil.which("ffmpeg")
-    if not exe:
-        raise AudioLoadError(
-            "Формат не поддерживается libsndfile, а ffmpeg не найден. "
-            "Установите ffmpeg и добавьте его в PATH."
-        )
+def _run_ffmpeg(
+    exe: str, source: Path, destination: Path
+) -> subprocess.CompletedProcess:
+    """Запускает ffmpeg и декодирует источник в WAV."""
     command = [
         exe,
         "-nostdin",
@@ -138,7 +135,7 @@ def _decode_with_ffmpeg(source: Path, destination: Path) -> None:
         str(destination),
     ]
     try:
-        process = subprocess.run(
+        return subprocess.run(
             command,
             capture_output=True,
             text=True,
@@ -147,10 +144,81 @@ def _decode_with_ffmpeg(source: Path, destination: Path) -> None:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise AudioLoadError(f"ffmpeg не смог обработать файл: {exc}") from exc
+
+
+def _decode_with_ffmpeg(source: Path, destination: Path) -> None:
+    """Декодирует файл в float32 WAV, обходя проблемы libsndfile с путями.
+
+    Если прямой вызов не сработал, а путь содержит не-ASCII символы,
+    исходник копируется во временный файл с ASCII-именем и попытка
+    повторяется. Так обходится баг ``psf_fseek()`` в libsndfile.
+    """
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        raise AudioLoadError(
+            "Формат не поддерживается libsndfile, а ffmpeg не найден. "
+            "Установите ffmpeg и добавьте его в PATH."
+        )
+
+    process = _run_ffmpeg(exe, source, destination)
+    if (process.returncode != 0 or not destination.exists()) and not str(
+        source
+    ).isascii():
+        # Копия нужна только как обходной путь для не-ASCII путей.
+        safe_source = destination.parent / f"source{source.suffix.lower()}"
+        try:
+            shutil.copyfile(source, safe_source)
+        except OSError:
+            pass
+        else:
+            process = _run_ffmpeg(exe, safe_source, destination)
+
     if process.returncode != 0 or not destination.exists():
         message = (process.stderr or "").strip().splitlines()
         detail = message[-1] if message else "неизвестная ошибка ffmpeg"
         raise AudioLoadError(f"ffmpeg не смог декодировать файл: {detail}")
+
+
+def _ascii_tempdir() -> tempfile.TemporaryDirectory:
+    """Создаёт временную папку с ASCII-путём, насколько это возможно."""
+    candidates = [Path(tempfile.gettempdir())]
+    system_root = os.environ.get("SystemRoot")
+    if system_root:
+        candidates.append(Path(system_root) / "Temp")
+    candidates.append(Path.cwd() / ".tmp")
+
+    for base in candidates:
+        try:
+            if not str(base).isascii():
+                continue
+            base.mkdir(parents=True, exist_ok=True)
+            return tempfile.TemporaryDirectory(
+                prefix="lossless_analyzer_", dir=str(base)
+            )
+        except OSError:
+            continue
+    return tempfile.TemporaryDirectory(prefix="lossless_analyzer_")
+
+
+def _path_hint(path: Path) -> str:
+    """Подсказка для файлов с эмодзи/спецсимволами в пути."""
+    if str(path).isascii():
+        return ""
+    return (
+        " Попробуйте переименовать файл или папку, убрав эмодзи "
+        "и спецсимволы из названия."
+    )
+
+
+def _validate_handle(handle: sf.SoundFile, source: Path) -> None:
+    """Проверяет, что файл действительно читается и поддерживает seek."""
+    if handle.frames < 256:
+        raise AudioLoadError("Файл слишком короткий для анализа.")
+    handle.seek(0)
+    block = handle.read(min(4096, handle.frames), dtype="float32", always_2d=True)
+    if block.size == 0:
+        raise AudioLoadError(f"Файл не содержит читаемых сэмплов: {source.name}")
+    handle.seek(0)
 
 
 def _ffprobe(path: Path) -> dict:
@@ -285,10 +353,12 @@ def _build_meta(
 
 
 @contextlib.contextmanager
-def open_audio(path: str | Path) -> Iterator[AudioHandle]:
+def open_audio(path: str | Path, force_ffmpeg: bool = False) -> Iterator[AudioHandle]:
     """Открывает файл для чтения, при необходимости декодируя его через ffmpeg.
 
-    Временный WAV удаляется автоматически после выхода из контекста.
+    Если libsndfile не может открыть файл (формат или не-ASCII путь) или
+    чтение/seek падает, автоматически используется ffmpeg. Временный WAV
+    удаляется после выхода из контекста.
     """
     original = Path(path)
     if not original.is_file():
@@ -298,32 +368,58 @@ def open_audio(path: str | Path) -> Iterator[AudioHandle]:
     tempdir: tempfile.TemporaryDirectory | None = None
     info: sf._SoundFileInfo | None = None
     handle: sf.SoundFile | None = None
+    used_fallback = False
 
-    try:
-        info = sf.info(str(original))
-        handle = sf.SoundFile(str(original))
-    except Exception:
-        # libsndfile не умеет этот формат — пробуем ffmpeg.
-        handle = None
-        info = None
-        tempdir = tempfile.TemporaryDirectory(prefix="lossless_analyzer_")
-        decoded = Path(tempdir.name) / "decoded.wav"
+    if not force_ffmpeg:
         try:
+            info = sf.info(str(original))
+            candidate = sf.SoundFile(str(original))
+            try:
+                _validate_handle(candidate, original)
+            except Exception:
+                candidate.close()
+                raise
+            handle = candidate
+        except AudioLoadError:
+            raise
+        except Exception:
+            # libsndfile не умеет формат или не может работать с путём.
+            info = None
+            handle = None
+
+    if handle is None:
+        try:
+            tempdir = _ascii_tempdir()
+            decoded = Path(tempdir.name) / "decoded.wav"
             _decode_with_ffmpeg(original, decoded)
             handle = sf.SoundFile(str(decoded))
+            _validate_handle(handle, original)
+            info = None
+            used_fallback = True
+        except AudioLoadError as exc:
+            if handle is not None:
+                handle.close()
+                handle = None
+            if tempdir is not None:
+                tempdir.cleanup()
+            message = str(exc)
+            if not message.endswith(_path_hint(original)):
+                message += _path_hint(original)
+            raise AudioLoadError(message) from exc
         except Exception as exc:
-            tempdir.cleanup()
-            if isinstance(exc, AudioLoadError):
-                raise
+            if handle is not None:
+                handle.close()
+                handle = None
+            if tempdir is not None:
+                tempdir.cleanup()
             raise AudioLoadError(
-                f"Не удалось открыть аудиофайл «{original.name}»: {exc}"
+                f"Не удалось прочитать аудиофайл «{original.name}» даже через "
+                f"ffmpeg: {exc}.{_path_hint(original)}"
             ) from exc
 
     try:
-        if handle.frames < 256:
-            raise AudioLoadError("Файл слишком короткий для анализа.")
         meta = _build_meta(original, handle, info, probe)
-        yield AudioHandle(file=handle, meta=meta)
+        yield AudioHandle(file=handle, meta=meta, used_fallback=used_fallback)
     finally:
         try:
             handle.close()

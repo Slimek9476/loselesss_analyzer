@@ -694,7 +694,15 @@ class MainWindow(QMainWindow):
                 if detection.drop_db is not None
                 else ""
             )
-            parts.append(f"<b>Срез:</b> {format_khz(detection.cutoff_hz)}{drop}")
+            transition = (
+                f" · переход ~{format_khz(detection.transition_width_hz)}"
+                if detection.transition_width_hz
+                and detection.transition_width_hz >= 100.0
+                else ""
+            )
+            parts.append(
+                f"<b>Срез:</b> {format_khz(detection.cutoff_hz)}{drop}{transition}"
+            )
         if detection.estimated_source:
             parts.append(f"<b>Источник:</b> {escape(detection.estimated_source)}")
         if result.meta.is_lossy:
@@ -715,9 +723,19 @@ class MainWindow(QMainWindow):
         self.verdict_label.setText("ОШИБКА АНАЛИЗА")
         self.verdict_label.setStyleSheet(f"color: {FAKE};")
         self.confidence_label.setText("")
-        self.reason_label.setText("Не удалось прочитать или проанализировать файл.")
+        if not str(Path(path)).isascii():
+            reason = (
+                "Не удалось прочитать файл. Попробуйте переименовать его, "
+                "убрав эмодзи или спецсимволы из названия."
+            )
+        else:
+            reason = (
+                "Не удалось прочитать или проанализировать файл. Проверьте, "
+                "что он не повреждён и его формат поддерживается."
+            )
+        self.reason_label.setText(reason)
         self.details_label.setText(
-            f"<span style='color:{MUTED}'>{escape(message)}</span>"
+            f"<span style='color:{MUTED}'>{escape(message).replace(chr(10), '<br>')}</span>"
         )
         self.verdict_card.setStyleSheet(
             "QFrame#verdictCard {"
